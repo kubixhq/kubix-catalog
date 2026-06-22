@@ -1,0 +1,16 @@
+services:
+  kubix-catalog:
+    image: ghcr.io/kubixhq/kubix-catalog:latest
+    ports:
+      - "8082:8082"
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_SSL_MODE: ${DB_SSL_MODE:-disable}
+      SERVER_PORT: 8082
+      SPEC_FETCH_TIMEOUT_SEC: ${SPEC_FETCH_TIMEOUT_SEC:-10}
+      MAX_SPEC_SIZE_MB: ${MAX_SPEC_SIZE_MB:-10}
+    restart: unless-stopped

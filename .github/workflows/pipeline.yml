@@ -1,0 +1,90 @@
+name: Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 9 * * 1"
+
+jobs:
+  lint:
+    if: github.event_name != 'schedule'
+    uses: kubixhq/.github/.github/workflows/reusable-lint-go.yml@main
+    with:
+      go-version: "1.25"
+
+  test:
+    needs: lint
+    uses: kubixhq/.github/.github/workflows/reusable-ci-go.yml@main
+    with:
+      go-version-matrix: '["1.24", "1.25"]'
+
+  integration:
+    name: Integration Tests (Go ${{ matrix.go-version }})
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ["1.24", "1.25"]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: kubix_catalog_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run integration tests
+        env:
+          TEST_DB_DSN: "host=localhost port=5432 dbname=kubix_catalog_test user=postgres password=postgres sslmode=disable"
+        run: go test -tags integration -race -timeout 60s -coverprofile=coverage-integration.out ./...
+
+      - name: Upload integration coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-integration-go${{ matrix.go-version }}
+          path: coverage-integration.out
+
+  codeql:
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    uses: kubixhq/.github/.github/workflows/reusable-codeql.yml@main
+    with:
+      language: go
+
+  release:
+    needs: [test, integration]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      packages: write
+    uses: kubixhq/.github/.github/workflows/reusable-release.yml@main
+    with:
+      image-name: kubix-catalog
+      language: go
