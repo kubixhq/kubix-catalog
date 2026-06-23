@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +19,7 @@ type Handler struct {
 	store  *catalog.Store
 	cfg    config.Config
 	client *http.Client
+	db     *sql.DB
 }
 
 func New(store *catalog.Store, cfg config.Config) *Handler {
@@ -28,6 +31,18 @@ func New(store *catalog.Store, cfg config.Config) *Handler {
 		},
 	}
 }
+
+func NewWithDB(store *catalog.Store, db *sql.DB, cfg config.Config) *Handler {
+	return &Handler{
+		store:  store,
+		db:     db,
+		cfg:    cfg,
+		client: &http.Client{Timeout: time.Duration(cfg.SpecFetchTimeoutSec) * time.Second},
+	}
+}
+
+// ensure context is used in ListVersions
+var _ = context.Background
 
 // POST /api/catalog/specs
 func (h *Handler) IngestSpec(w http.ResponseWriter, r *http.Request) {
@@ -145,12 +160,31 @@ func (h *Handler) BreakingChanges(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "service, from, and to query parameters are required")
 		return
 	}
+	// camelCase response matching the dashboard types
+	type apiChange struct {
+		RiskLevel  string `json:"riskLevel"`
+		ChangeType string `json:"changeType"`
+		Details    string `json:"details"`
+		Group      string `json:"group"`
+	}
+	type affectedSvc struct {
+		Name          string `json:"name"`
+		EndpointCount int    `json:"endpointCount"`
+	}
+	type apiBreakingResponse struct {
+		RiskLevel        string        `json:"riskLevel"`
+		Changes          []apiChange   `json:"changes"`
+		AffectedServices []affectedSvc `json:"affectedServices"`
+	}
+
+	emptyResp := apiBreakingResponse{
+		RiskLevel:        "NONE",
+		Changes:          []apiChange{},
+		AffectedServices: []affectedSvc{},
+	}
+
 	if from == to {
-		writeJSON(w, http.StatusOK, catalog.BreakingChangesResponse{
-			BreakingChanges:  []catalog.BreakingChange{},
-			RiskLevel:        "none",
-			AffectedServices: []string{},
-		})
+		writeJSON(w, http.StatusOK, emptyResp)
 		return
 	}
 
@@ -165,21 +199,101 @@ func (h *Handler) BreakingChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	changes := catalog.DetectBreakingChanges(oldEndpoints, newEndpoints)
-	if changes == nil {
-		changes = []catalog.BreakingChange{}
+	rawChanges := catalog.DetectBreakingChanges(oldEndpoints, newEndpoints)
+	if rawChanges == nil {
+		rawChanges = []catalog.BreakingChange{}
 	}
 
-	affected, _ := h.store.AffectedServices(service)
-	if affected == nil {
-		affected = []string{}
+	apiChanges := make([]apiChange, 0, len(rawChanges))
+	for _, c := range rawChanges {
+		group := "Endpoint"
+		if strings.Contains(c.Type, "request") || strings.Contains(c.Type, "param") {
+			group = "Request"
+		} else if strings.Contains(c.Type, "response") || strings.Contains(c.Type, "field") {
+			group = "Response"
+		}
+		riskLvl := strings.ToUpper(c.Risk)
+		if riskLvl == "" {
+			riskLvl = "MEDIUM"
+		}
+		apiChanges = append(apiChanges, apiChange{
+			RiskLevel:  riskLvl,
+			ChangeType: c.Type,
+			Details:    c.Description,
+			Group:      group,
+		})
 	}
 
-	writeJSON(w, http.StatusOK, catalog.BreakingChangesResponse{
-		BreakingChanges:  changes,
-		RiskLevel:        catalog.RiskLevel(changes),
+	affectedNames, _ := h.store.AffectedServices(service)
+	if affectedNames == nil {
+		affectedNames = []string{}
+	}
+	affected := make([]affectedSvc, 0, len(affectedNames))
+	for _, name := range affectedNames {
+		affected = append(affected, affectedSvc{Name: name, EndpointCount: 0})
+	}
+
+	overallRisk := strings.ToUpper(catalog.RiskLevel(rawChanges))
+	if overallRisk == "" {
+		overallRisk = "NONE"
+	}
+
+	writeJSON(w, http.StatusOK, apiBreakingResponse{
+		RiskLevel:        overallRisk,
+		Changes:          apiChanges,
 		AffectedServices: affected,
 	})
+}
+
+// POST /api/catalog/services  { name, specUrl }
+func (h *Handler) CreateService(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name    string `json:"name"`
+		SpecURL string `json:"specUrl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Name == "" || req.SpecURL == "" {
+		writeError(w, http.StatusBadRequest, "name and specUrl are required")
+		return
+	}
+
+	rawData, err := h.fetchSpec(req.SpecURL)
+	if err != nil {
+		writeError(w, statusForFetchErr(err), err.Error())
+		return
+	}
+
+	parsed, err := catalog.Parse(rawData)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "spec parse error: "+err.Error())
+		return
+	}
+
+	version := parsed.APIVersion
+	if version == "" {
+		version = "v1"
+	}
+
+	serviceID, err := h.store.IngestSpec(req.Name, req.SpecURL, version, parsed.Endpoints, parsed.RawJSON)
+	if err != nil {
+		var ce *catalog.ConflictError
+		if asConflict(err, &ce) {
+			writeError(w, http.StatusConflict, ce.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to save service")
+		return
+	}
+
+	svc, err := h.store.GetService(serviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "service created but could not be retrieved")
+		return
+	}
+	writeJSON(w, http.StatusCreated, svc)
 }
 
 // GET /api/catalog/services
@@ -193,10 +307,10 @@ func (h *Handler) ListServices(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list services")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"services": services,
-		"total":    len(services),
-	})
+	if services == nil {
+		services = []catalog.ServiceInfo{}
+	}
+	writeJSON(w, http.StatusOK, services)
 }
 
 // GET /api/catalog/services/{id}
@@ -210,7 +324,106 @@ func (h *Handler) GetService(w http.ResponseWriter, r *http.Request) {
 		h.handleStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, svc)
+
+	type apiEndpoint struct {
+		Method      string   `json:"method"`
+		Path        string   `json:"path"`
+		Description string   `json:"description"`
+		Tags        []string `json:"tags"`
+	}
+	type serviceDetail struct {
+		ID            int           `json:"id"`
+		Name          string        `json:"name"`
+		SpecURL       string        `json:"specUrl,omitempty"`
+		LastUpdated   string        `json:"lastUpdated"`
+		EndpointCount int           `json:"endpointCount"`
+		Status        string        `json:"status"`
+		Endpoints     []apiEndpoint `json:"endpoints"`
+	}
+
+	detail := serviceDetail{
+		ID:            svc.ID,
+		Name:          svc.ServiceName,
+		SpecURL:       svc.SpecURL,
+		LastUpdated:   svc.LastUpdated.Format("2006-01-02T15:04:05Z07:00"),
+		EndpointCount: svc.EndpointCount,
+		Status:        svc.Health,
+		Endpoints:     []apiEndpoint{},
+	}
+
+	if spec, err := h.store.GetSpec(id); err == nil {
+		for _, ep := range spec.Endpoints {
+			tags := ep.Tags
+			if tags == nil {
+				tags = []string{}
+			}
+			detail.Endpoints = append(detail.Endpoints, apiEndpoint{
+				Method:      ep.Method,
+				Path:        ep.Path,
+				Description: ep.Description,
+				Tags:        tags,
+			})
+		}
+		detail.EndpointCount = len(detail.Endpoints)
+	}
+
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// POST /api/catalog/services/{name}/dependencies  {"dependsOn":["svc-a","svc-b"]}
+func (h *Handler) AddDependencies(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "service name required")
+		return
+	}
+	var req struct {
+		DependsOn []string `json:"dependsOn"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := h.store.SaveDependencies(name, req.DependsOn); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save dependencies")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+}
+
+// GET /api/catalog/services/{id}/versions
+func (h *Handler) ListVersions(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	type versionInfo struct {
+		SpecVersion   string `json:"specVersion"`
+		EndpointCount int    `json:"endpointCount"`
+		IngestedAt    string `json:"ingestedAt"`
+	}
+	rows, err := h.db.QueryContext(r.Context(), `
+		SELECT cs.spec_version, cs.endpoint_count, cs.ingested_at::text
+		FROM catalog_specs cs
+		WHERE cs.service_id = $1
+		ORDER BY cs.ingested_at DESC
+	`, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list versions")
+		return
+	}
+	defer rows.Close()
+	var versions []versionInfo
+	for rows.Next() {
+		var v versionInfo
+		if err := rows.Scan(&v.SpecVersion, &v.EndpointCount, &v.IngestedAt); err == nil {
+			versions = append(versions, v)
+		}
+	}
+	if versions == nil {
+		versions = []versionInfo{}
+	}
+	writeJSON(w, http.StatusOK, versions)
 }
 
 // DELETE /api/catalog/services/{id}

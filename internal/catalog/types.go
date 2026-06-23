@@ -52,11 +52,11 @@ type ParsedSpec struct {
 
 type ServiceInfo struct {
 	ID            int       `json:"id"`
-	ServiceName   string    `json:"service_name"`
-	SpecURL       string    `json:"spec_url,omitempty"`
-	LastUpdated   time.Time `json:"last_updated"`
-	EndpointCount int       `json:"endpoint_count"`
-	Health        string    `json:"health"`
+	ServiceName   string    `json:"name"`
+	SpecURL       string    `json:"specUrl,omitempty"`
+	LastUpdated   time.Time `json:"lastUpdated"`
+	EndpointCount int       `json:"endpointCount"`
+	Health        string    `json:"status"`
 }
 
 type SpecRecord struct {
